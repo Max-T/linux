@@ -12,15 +12,17 @@
 #include <drm/drm_plane_helper.h>
 #include <drm/drm_probe_helper.h>
 
-#include "sun8i_vi_layer.h"
+#include "sun8i_csc.h"
 #include "sun8i_mixer.h"
+#include "sun8i_vi_layer.h"
 #include "sun8i_vi_scaler.h"
 
 static void sun8i_vi_layer_enable(struct sun8i_mixer *mixer, int channel,
-				  int overlay, bool enable, unsigned int zpos,
-				  unsigned int old_zpos)
+				  int overlay, bool was_enabled, bool enable,
+				  unsigned int zpos, unsigned int old_zpos)
 {
 	u32 val, bld_base, ch_base;
+	unsigned int old_pipe_ch;
 
 	bld_base = sun8i_blender_base(mixer);
 	ch_base = sun8i_channel_base(mixer, channel);
@@ -28,28 +30,56 @@ static void sun8i_vi_layer_enable(struct sun8i_mixer *mixer, int channel,
 	DRM_DEBUG_DRIVER("%sabling VI channel %d overlay %d\n",
 			 enable ? "En" : "Dis", channel, overlay);
 
-	if (enable)
-		val = SUN8I_MIXER_CHAN_VI_LAYER_ATTR_EN;
-	else
-		val = 0;
-
+	/* We always update the layer enable bit, because it can clear
+	 * spontaneously for unknown reasons. */
+	val = enable ? SUN8I_MIXER_CHAN_VI_LAYER_ATTR_EN : 0;
 	regmap_update_bits(mixer->engine.regs,
 			   SUN8I_MIXER_CHAN_VI_LAYER_ATTR(ch_base, overlay),
 			   SUN8I_MIXER_CHAN_VI_LAYER_ATTR_EN, val);
 
-	if (!enable || zpos != old_zpos) {
-		regmap_update_bits(mixer->engine.regs,
-				   SUN8I_MIXER_BLEND_PIPE_CTL(bld_base),
-				   SUN8I_MIXER_BLEND_PIPE_CTL_EN(old_zpos),
-				   0);
-
-		regmap_update_bits(mixer->engine.regs,
+	/*
+	 * If this layer was enabled and is being disabled or if it is
+	 * enabled and just changing zpos, clear the old route, if it is
+	 * still configured to this layer in HW.
+	 */
+	if ((was_enabled && !enable) || (enable && zpos != old_zpos)) {
+		/* get channel the pipe for old_zpos is routed to from the HW */
+		regmap_read(mixer->engine.regs,
 				   SUN8I_MIXER_BLEND_ROUTE(bld_base),
-				   SUN8I_MIXER_BLEND_ROUTE_PIPE_MSK(old_zpos),
-				   0);
+				   &old_pipe_ch);
+		old_pipe_ch &= SUN8I_MIXER_BLEND_ROUTE_PIPE_MSK(old_zpos);
+		old_pipe_ch >>= SUN8I_MIXER_BLEND_ROUTE_PIPE_SHIFT(old_zpos);
+
+		/*
+		 * Check that pipe for old_zpos is still routed to our layer,
+		 * and clear/disable it if it is.
+		 */
+
+		if (old_pipe_ch == channel) {
+			DRM_DEBUG_DRIVER("chan=%d en=%d->%d zpos=%d->%d\n",
+			       channel, was_enabled, enable, old_zpos, zpos);
+
+			DRM_DEBUG_DRIVER("  disable pipe %d\n", old_zpos);
+
+			regmap_update_bits(mixer->engine.regs,
+					   SUN8I_MIXER_BLEND_ROUTE(bld_base),
+					   SUN8I_MIXER_BLEND_ROUTE_PIPE_MSK(old_zpos),
+					   0);
+
+			regmap_update_bits(mixer->engine.regs,
+					   SUN8I_MIXER_BLEND_PIPE_CTL(bld_base),
+					   SUN8I_MIXER_BLEND_PIPE_CTL_EN(old_zpos),
+					   0);
+		}
 	}
 
-	if (enable) {
+	/*
+	 * If enabling this layer or changin zpos, set route to this layer.
+	 */
+	if ((enable && !was_enabled) || (enable && zpos != old_zpos)) {
+		DRM_DEBUG_DRIVER("chan=%d en=%d->%d zpos=%d->%d\n",
+		       channel, was_enabled, enable, old_zpos, zpos);
+
 		val = SUN8I_MIXER_BLEND_PIPE_CTL_EN(zpos);
 
 		regmap_update_bits(mixer->engine.regs,
@@ -62,6 +92,8 @@ static void sun8i_vi_layer_enable(struct sun8i_mixer *mixer, int channel,
 				   SUN8I_MIXER_BLEND_ROUTE(bld_base),
 				   SUN8I_MIXER_BLEND_ROUTE_PIPE_MSK(zpos),
 				   val);
+
+		DRM_DEBUG_DRIVER("  enable pipe %d <- ch %d\n", zpos, channel);
 	}
 }
 
@@ -210,28 +242,47 @@ static int sun8i_vi_layer_update_coord(struct sun8i_mixer *mixer, int channel,
 	return 0;
 }
 
+static u32 sun8i_vi_layer_get_csc_mode(const struct drm_format_info *format)
+{
+	if (!format->is_yuv)
+		return SUN8I_CSC_MODE_OFF;
+
+	switch (format->format) {
+	case DRM_FORMAT_YVU411:
+	case DRM_FORMAT_YVU420:
+	case DRM_FORMAT_YVU422:
+	case DRM_FORMAT_YVU444:
+		return SUN8I_CSC_MODE_YVU2RGB;
+	default:
+		return SUN8I_CSC_MODE_YUV2RGB;
+	}
+}
+
 static int sun8i_vi_layer_update_formats(struct sun8i_mixer *mixer, int channel,
 					 int overlay, struct drm_plane *plane)
 {
 	struct drm_plane_state *state = plane->state;
-	const struct de2_fmt_info *fmt_info;
-	u32 val, ch_base;
+	u32 val, ch_base, csc_mode, hw_fmt;
+	const struct drm_format_info *fmt;
+	int ret;
 
 	ch_base = sun8i_channel_base(mixer, channel);
 
-	fmt_info = sun8i_mixer_format_info(state->fb->format->format);
-	if (!fmt_info) {
+	fmt = state->fb->format;
+	ret = sun8i_mixer_drm_format_to_hw(fmt->format, &hw_fmt);
+	if (ret) {
 		DRM_DEBUG_DRIVER("Invalid format\n");
-		return -EINVAL;
+		return ret;
 	}
 
-	val = fmt_info->de2_fmt << SUN8I_MIXER_CHAN_VI_LAYER_ATTR_FBFMT_OFFSET;
+	val = hw_fmt << SUN8I_MIXER_CHAN_VI_LAYER_ATTR_FBFMT_OFFSET;
 	regmap_update_bits(mixer->engine.regs,
 			   SUN8I_MIXER_CHAN_VI_LAYER_ATTR(ch_base, overlay),
 			   SUN8I_MIXER_CHAN_VI_LAYER_ATTR_FBFMT_MASK, val);
 
-	if (fmt_info->csc != SUN8I_CSC_MODE_OFF) {
-		sun8i_csc_set_ccsc_coefficients(mixer, channel, fmt_info->csc,
+	csc_mode = sun8i_vi_layer_get_csc_mode(fmt);
+	if (csc_mode != SUN8I_CSC_MODE_OFF) {
+		sun8i_csc_set_ccsc_coefficients(mixer, channel, csc_mode,
 						state->color_encoding,
 						state->color_range);
 		sun8i_csc_enable_ccsc(mixer, channel, true);
@@ -239,7 +290,7 @@ static int sun8i_vi_layer_update_formats(struct sun8i_mixer *mixer, int channel,
 		sun8i_csc_enable_ccsc(mixer, channel, false);
 	}
 
-	if (fmt_info->rgb)
+	if (!fmt->is_yuv)
 		val = SUN8I_MIXER_CHAN_VI_LAYER_ATTR_RGB_MODE;
 	else
 		val = 0;
@@ -346,17 +397,6 @@ static int sun8i_vi_layer_atomic_check(struct drm_plane *plane,
 						   true, true);
 }
 
-static void sun8i_vi_layer_atomic_disable(struct drm_plane *plane,
-					  struct drm_plane_state *old_state)
-{
-	struct sun8i_vi_layer *layer = plane_to_sun8i_vi_layer(plane);
-	unsigned int old_zpos = old_state->normalized_zpos;
-	struct sun8i_mixer *mixer = layer->mixer;
-
-	sun8i_vi_layer_enable(mixer, layer->channel, layer->overlay, false, 0,
-			      old_zpos);
-}
-
 static void sun8i_vi_layer_atomic_update(struct drm_plane *plane,
 					 struct drm_plane_state *old_state)
 {
@@ -364,27 +404,36 @@ static void sun8i_vi_layer_atomic_update(struct drm_plane *plane,
 	unsigned int zpos = plane->state->normalized_zpos;
 	unsigned int old_zpos = old_state->normalized_zpos;
 	struct sun8i_mixer *mixer = layer->mixer;
+	bool was_enabled = old_state->crtc && old_state->visible;
+	bool enable = plane->state->crtc && plane->state->visible;
 
-	if (!plane->state->visible) {
-		sun8i_vi_layer_enable(mixer, layer->channel,
-				      layer->overlay, false, 0, old_zpos);
-		return;
+	if (enable) {
+		sun8i_vi_layer_update_coord(mixer, layer->channel,
+					    layer->overlay, plane, zpos);
+		sun8i_vi_layer_update_formats(mixer, layer->channel,
+					      layer->overlay, plane);
+		sun8i_vi_layer_update_buffer(mixer, layer->channel,
+					     layer->overlay, plane);
 	}
 
-	sun8i_vi_layer_update_coord(mixer, layer->channel,
-				    layer->overlay, plane, zpos);
-	sun8i_vi_layer_update_formats(mixer, layer->channel,
-				      layer->overlay, plane);
-	sun8i_vi_layer_update_buffer(mixer, layer->channel,
-				     layer->overlay, plane);
 	sun8i_vi_layer_enable(mixer, layer->channel, layer->overlay,
-			      true, zpos, old_zpos);
+			      was_enabled, enable, zpos, old_zpos);
+}
+
+void sun8i_vi_layer_plane_reset(struct drm_plane *plane)
+{
+	struct sun8i_vi_layer *layer = plane_to_sun8i_vi_layer(plane);
+
+	drm_atomic_helper_plane_reset(plane);
+	if (!plane->state)
+		return;
+
+	plane->state->zpos = layer->channel;
 }
 
 static struct drm_plane_helper_funcs sun8i_vi_layer_helper_funcs = {
 	.prepare_fb	= drm_gem_fb_prepare_fb,
 	.atomic_check	= sun8i_vi_layer_atomic_check,
-	.atomic_disable	= sun8i_vi_layer_atomic_disable,
 	.atomic_update	= sun8i_vi_layer_atomic_update,
 };
 
@@ -393,31 +442,31 @@ static const struct drm_plane_funcs sun8i_vi_layer_funcs = {
 	.atomic_duplicate_state	= drm_atomic_helper_plane_duplicate_state,
 	.destroy		= drm_plane_cleanup,
 	.disable_plane		= drm_atomic_helper_disable_plane,
-	.reset			= drm_atomic_helper_plane_reset,
+	.reset			= sun8i_vi_layer_plane_reset,
 	.update_plane		= drm_atomic_helper_update_plane,
 };
 
 /*
- * While all RGB formats are supported, VI planes don't support
- * alpha blending, so there is no point having formats with alpha
- * channel if their opaque analog exist.
+ * While DE2 VI layer supports same RGB formats as UI layer, alpha
+ * channel is ignored. This structure lists all unique variants
+ * where alpha channel is replaced with "don't care" (X) channel.
  */
 static const u32 sun8i_vi_layer_formats[] = {
-	DRM_FORMAT_ABGR1555,
-	DRM_FORMAT_ABGR4444,
-	DRM_FORMAT_ARGB1555,
-	DRM_FORMAT_ARGB4444,
 	DRM_FORMAT_BGR565,
 	DRM_FORMAT_BGR888,
-	DRM_FORMAT_BGRA5551,
-	DRM_FORMAT_BGRA4444,
+	DRM_FORMAT_BGRX4444,
+	DRM_FORMAT_BGRX5551,
 	DRM_FORMAT_BGRX8888,
 	DRM_FORMAT_RGB565,
 	DRM_FORMAT_RGB888,
-	DRM_FORMAT_RGBA4444,
-	DRM_FORMAT_RGBA5551,
+	DRM_FORMAT_RGBX4444,
+	DRM_FORMAT_RGBX5551,
 	DRM_FORMAT_RGBX8888,
+	DRM_FORMAT_XBGR1555,
+	DRM_FORMAT_XBGR4444,
 	DRM_FORMAT_XBGR8888,
+	DRM_FORMAT_XRGB1555,
+	DRM_FORMAT_XRGB4444,
 	DRM_FORMAT_XRGB8888,
 
 	DRM_FORMAT_NV16,
@@ -431,11 +480,53 @@ static const u32 sun8i_vi_layer_formats[] = {
 	DRM_FORMAT_YUV411,
 	DRM_FORMAT_YUV420,
 	DRM_FORMAT_YUV422,
-	DRM_FORMAT_YUV444,
 	DRM_FORMAT_YVU411,
 	DRM_FORMAT_YVU420,
 	DRM_FORMAT_YVU422,
-	DRM_FORMAT_YVU444,
+};
+
+static const u32 sun8i_vi_layer_de3_formats[] = {
+	DRM_FORMAT_ABGR1555,
+	DRM_FORMAT_ABGR2101010,
+	DRM_FORMAT_ABGR4444,
+	DRM_FORMAT_ABGR8888,
+	DRM_FORMAT_ARGB1555,
+	DRM_FORMAT_ARGB2101010,
+	DRM_FORMAT_ARGB4444,
+	DRM_FORMAT_ARGB8888,
+	DRM_FORMAT_BGR565,
+	DRM_FORMAT_BGR888,
+	DRM_FORMAT_BGRA1010102,
+	DRM_FORMAT_BGRA5551,
+	DRM_FORMAT_BGRA4444,
+	DRM_FORMAT_BGRA8888,
+	DRM_FORMAT_BGRX8888,
+	DRM_FORMAT_RGB565,
+	DRM_FORMAT_RGB888,
+	DRM_FORMAT_RGBA1010102,
+	DRM_FORMAT_RGBA4444,
+	DRM_FORMAT_RGBA5551,
+	DRM_FORMAT_RGBA8888,
+	DRM_FORMAT_RGBX8888,
+	DRM_FORMAT_XBGR8888,
+	DRM_FORMAT_XRGB8888,
+
+	DRM_FORMAT_NV16,
+	DRM_FORMAT_NV12,
+	DRM_FORMAT_NV21,
+	DRM_FORMAT_NV61,
+	DRM_FORMAT_P010,
+	DRM_FORMAT_P210,
+	DRM_FORMAT_UYVY,
+	DRM_FORMAT_VYUY,
+	DRM_FORMAT_YUYV,
+	DRM_FORMAT_YVYU,
+	DRM_FORMAT_YUV411,
+	DRM_FORMAT_YUV420,
+	DRM_FORMAT_YUV422,
+	DRM_FORMAT_YVU411,
+	DRM_FORMAT_YVU420,
+	DRM_FORMAT_YVU422,
 };
 
 struct sun8i_vi_layer *sun8i_vi_layer_init_one(struct drm_device *drm,
@@ -443,19 +534,27 @@ struct sun8i_vi_layer *sun8i_vi_layer_init_one(struct drm_device *drm,
 					       int index)
 {
 	u32 supported_encodings, supported_ranges;
+	unsigned int plane_cnt, format_count;
 	struct sun8i_vi_layer *layer;
-	unsigned int plane_cnt;
+	const u32 *formats;
 	int ret;
 
 	layer = devm_kzalloc(drm->dev, sizeof(*layer), GFP_KERNEL);
 	if (!layer)
 		return ERR_PTR(-ENOMEM);
 
+	if (mixer->cfg->is_de3) {
+		formats = sun8i_vi_layer_de3_formats;
+		format_count = ARRAY_SIZE(sun8i_vi_layer_de3_formats);
+	} else {
+		formats = sun8i_vi_layer_formats;
+		format_count = ARRAY_SIZE(sun8i_vi_layer_formats);
+	}
+
 	/* possible crtcs are set later */
 	ret = drm_universal_plane_init(drm, &layer->plane, 0,
 				       &sun8i_vi_layer_funcs,
-				       sun8i_vi_layer_formats,
-				       ARRAY_SIZE(sun8i_vi_layer_formats),
+				       formats, format_count,
 				       NULL, DRM_PLANE_TYPE_OVERLAY, NULL);
 	if (ret) {
 		dev_err(drm->dev, "Couldn't initialize layer\n");

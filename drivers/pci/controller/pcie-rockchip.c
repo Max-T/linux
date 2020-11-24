@@ -45,9 +45,8 @@ int rockchip_pcie_parse_dt(struct rockchip_pcie *rockchip)
 			return -EINVAL;
 	}
 
-	regs = platform_get_resource_byname(pdev, IORESOURCE_MEM,
-					    "apb-base");
-	rockchip->apb_base = devm_ioremap_resource(dev, regs);
+	rockchip->apb_base =
+		devm_platform_ioremap_resource_byname(pdev, "apb-base");
 	if (IS_ERR(rockchip->apb_base))
 		return PTR_ERR(rockchip->apb_base);
 
@@ -148,6 +147,14 @@ int rockchip_pcie_parse_dt(struct rockchip_pcie *rockchip)
 	if (IS_ERR(rockchip->clk_pcie_pm)) {
 		dev_err(dev, "pm clock not found\n");
 		return PTR_ERR(rockchip->clk_pcie_pm);
+	}
+
+	err = of_property_read_u32(node, "bus-scan-delay-ms", &rockchip->bus_scan_delay);
+	if (err) {
+		dev_info(dev, "no bus-scan-delay-ms in device tree, default 0 ms\n");
+		rockchip->bus_scan_delay = 0;
+	} else {
+		dev_info(dev, "bus-scan-delay-ms in device tree is %u ms\n", rockchip->bus_scan_delay);
 	}
 
 	return 0;

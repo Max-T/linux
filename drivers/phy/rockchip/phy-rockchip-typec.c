@@ -40,6 +40,7 @@
 #include <linux/clk-provider.h>
 #include <linux/delay.h>
 #include <linux/extcon.h>
+#include <linux/extcon-provider.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
 #include <linux/kernel.h>
@@ -347,7 +348,7 @@ struct usb3phy_reg {
 };
 
 /**
- * struct rockchip_usb3phy_port_cfg: usb3-phy port configuration.
+ * struct rockchip_usb3phy_port_cfg - usb3-phy port configuration.
  * @reg: the base address for usb3-phy config.
  * @typec_conn_dir: the register of type-c connector direction.
  * @usb3tousb2_en: the register of type-c force usb2 to usb2 enable.
@@ -1160,6 +1161,22 @@ static int rockchip_typec_phy_probe(struct platform_device *pdev)
 				dev_err(dev, "Invalid or missing extcon\n");
 			return PTR_ERR(tcphy->extcon);
 		}
+	} else {
+		extcon_set_property_capability(tcphy->extcon, EXTCON_USB,
+					       EXTCON_PROP_USB_SS);
+		extcon_set_property_capability(tcphy->extcon, EXTCON_USB_HOST,
+					       EXTCON_PROP_USB_SS);
+		extcon_set_property_capability(tcphy->extcon, EXTCON_DISP_DP,
+					       EXTCON_PROP_USB_SS);
+		extcon_set_property_capability(tcphy->extcon, EXTCON_USB,
+					       EXTCON_PROP_USB_TYPEC_POLARITY);
+		extcon_set_property_capability(tcphy->extcon, EXTCON_USB_HOST,
+					       EXTCON_PROP_USB_TYPEC_POLARITY);
+		extcon_set_property_capability(tcphy->extcon, EXTCON_DISP_DP,
+					       EXTCON_PROP_USB_TYPEC_POLARITY);
+		extcon_sync(tcphy->extcon, EXTCON_USB);
+		extcon_sync(tcphy->extcon, EXTCON_USB_HOST);
+		extcon_sync(tcphy->extcon, EXTCON_DISP_DP);
 	}
 
 	pm_runtime_enable(dev);
